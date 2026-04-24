@@ -12,8 +12,44 @@
 # limitations under the License.
 # ==============================================================================
 """
-The definition of objects transferred between different
-processes (TokenizerManager, DetokenizerManager, Scheduler).
+不同进程（TokenizerManager、DetokenizerManager、Scheduler）之间传递的对象定义。
+"""
+
+"""
+这个文件定义了 SGLang 各进程间传递的数据结构（Data Transfer Objects），是理解 SGLang 架构的关键入口，
+
+因为它清晰地展示了系统的三大核心组件之间的通信协议：
+
+TokenizerManager  ←→  Scheduler  ←→  DetokenizerManager
+"""
+
+
+"""
+文件结构一览
+
+  ┌─────────────────────────────────────────────────────────┐
+  │  基类 (L51-90)                                           │
+  │  ├── BaseReq          单条请求/响应基类                    │
+  │  └── BaseBatchReq     批量请求/响应基类                    │
+  ├─────────────────────────────────────────────────────────┤
+  │  核心请求 (L141-1060) ← 最重要，占了一半篇幅                 │
+  │  ├── GenerateReqInput          用户生成请求（最复杂）       │
+  │  ├── TokenizedGenerateReqInput  tokenize 后的生成请求     │
+  │  ├── EmbeddingReqInput         Embedding 请求            │
+  │  └── TokenizedEmbeddingReqInput tokenize 后的 Embedding  │
+  ├─────────────────────────────────────────────────────────┤
+  │  核心输出 (L1063-1220)                                   │
+  │  ├── BatchTokenIDOutput    Scheduler → Detokenizer       │
+  │  ├── BatchStrOutput        Detokenizer → TokenizerManager│
+  │  └── BatchEmbeddingOutput  Embedding 结果                 │
+  ├─────────────────────────────────────────────────────────┤
+  │  控制面请求 (L1222-1880) ← 运维管理用，用到再看               │
+  │  ├── 缓存管理    FlushCache / ClearHiCache / AttachHiCache│
+  │  ├── 权重更新    UpdateWeightFromDisk/Distributed/Tensor  │
+  │  ├── LoRA 管理   LoadLoRA / UnloadLoRA                   │
+  │  ├── 调度控制    PauseGeneration / ContinueGeneration     │
+  │  ├── Profiling  ProfileReq                                 │
+  │  └── 负载查询    GetLoadsReqInput/Output                  │
 """
 
 from __future__ import annotations
@@ -40,20 +76,24 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData
 
-# Handle serialization of Image for pydantic
+# 处理 Image 的 pydantic 序列化
 if TYPE_CHECKING:
     from PIL.Image import Image
 else:
     Image = Any
 
 
+# BaseReq 和 BaseBatchReq 是 SGLang 所有请求/响应数据结构的基类
 @dataclass
-class BaseReq(ABC):
+class BaseReq(ABC):  # @haifeng 这个是用户请求
+    # 请求 ID（Request ID），用于全局追踪一个请求。可以是单个字符串，也可以是字符串列表（批量场景）
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
+    # @haifeng http_worker_ipc：HTTP worker 的 IPC 地址，用于将结果回传给对应的 HTTP worker
     http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
 
+    # @haifeng IPC是指进程间通信（Inter-Process Communication），在 SGLang 中用于不同进程之间传递数据和消息。HTTP worker 是处理 HTTP 请求的进程，而其他组件（如 TokenizerManager、Scheduler、DetokenizerManager）可能在不同的进程中运行。通过 IPC，系统可以将请求的结果从处理进程发送回 HTTP worker，以便最终返回给客户端。
     def regenerate_rid(self):
-        """Generate a new request ID and return it."""
+        """生成新的请求 ID 并返回。"""
         if isinstance(self.rid, list):
             self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
         else:
@@ -61,7 +101,7 @@ class BaseReq(ABC):
         return self.rid
 
     def _validate_rid_uniqueness(self):
-        """Validate that request IDs within a batch are unique."""
+        """验证批次内的请求 ID 是否唯一。"""
         if isinstance(self.rid, list) and len(set(self.rid)) != len(self.rid):
             counts = Counter(self.rid)
             duplicates = [rid for rid, count in counts.items() if count > 1]
@@ -71,12 +111,12 @@ class BaseReq(ABC):
 
 
 @dataclass
-class BaseBatchReq(ABC):
+class BaseBatchReq(ABC):  # @haifeng 这个是 系统内部的，一定是列表且一定不会重复
     rids: Optional[List[str]] = field(default=None, kw_only=True)
     http_worker_ipcs: Optional[List[str]] = field(default=None, kw_only=True)
 
     def regenerate_rids(self):
-        """Generate new request IDs and return them."""
+        """生成新的请求 ID 列表并返回。"""
         self.rids = [uuid.uuid4().hex for _ in range(len(self.rids))]
         return self.rids
 
@@ -84,26 +124,25 @@ class BaseBatchReq(ABC):
 @dataclass
 class SpeculativeDecodingMetricsMixin:
     """
-    Mixin class containing speculative decoding metrics.
+    包含推测解码指标的混入类。
 
-    This class consolidates speculative decoding metrics that are shared across
-    batch output types that support speculative decoding to avoid code duplication.
+    该类整合了推测解码指标，这些指标在支持推测解码的批量输出类型之间共享，以避免代码重复。
     """
 
-    # Verify count: number of verification forward passes
+    # 验证次数：验证前向传播的次数
     spec_verify_ct: List[int]
 
-    # Accepted tokens: Number of accepted tokens during speculative decoding
+    # 接受的 token 数：推测解码过程中接受的 token 数量
     spec_accepted_tokens: List[int]
 
-    # Acceptance histogram: List of lists, where each inner list represents histogram counts.
-    # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
-    # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
-    # Empty list [] when speculative decoding is disabled.
+    # 接受直方图：列表的列表，每个内部列表表示直方图计数。
+    # 列表索引 = 单步中接受的 token 数，列表值 = 具有该数量接受 token 的步数。
+    # 例如：histogram[0] = 5 表示有 5 步接受了 0 个 token，histogram[3] = 10 表示有 10 步接受了 3 个 token。
+    # 当推测解码被禁用时为空列表 []。
     spec_acceptance_histogram: List[List[int]]
 
 
-# Parameters for a session
+# 会话参数
 @dataclass
 class SessionParams:
     id: Optional[str] = None
@@ -113,16 +152,29 @@ class SessionParams:
     drop_previous_output: Optional[bool] = None
 
 
-# Type definitions for multimodal input data
-# Individual data item types for each modality
+"""
+@haifeng 使用场景
+  多轮对话时，前一轮的 KV cache 可以复用，不需要重新计算：
+  第1轮: "你好" → 计算 KV cache，保存在 session 中
+  第2轮: "今天天气怎么样" → 复用第1轮的 KV cache，从 offset 位置继续
+  - offset — 告诉系统从 KV cache 的哪个 token 位置接着算，避免重复计算前面的内容
+  - replace — 如果用户修改了对话中间的内容，设为 True 就会替换 offset 之后的 cache
+  - drop_previous_output — 丢弃前一轮的生成输出，只保留输入部分的 cache
+  简单来说
+  Session 机制让多轮对话不用每次都从头算，SessionParams 就是控制怎么复用和管理之前缓存的参数。
+"""
+
+
+# 多模态输入数据的类型定义
+# 每种模态的单个数据项类型
 ImageDataInputItem = Union[Image, str, ImageData, Dict]
 AudioDataInputItem = Union[str, Dict]
 VideoDataInputItem = Union[str, Dict]
-# Union type for any multimodal data item
+# 任意多模态数据项的联合类型
 MultimodalDataInputItem = Union[
     ImageDataInputItem, VideoDataInputItem, AudioDataInputItem
 ]
-# Format types supporting single items, lists, or nested lists for batch processing
+# 支持单个项、列表或嵌套列表的格式类型，用于批处理
 MultimodalDataInputFormat = Union[
     List[List[MultimodalDataInputItem]],
     List[MultimodalDataInputItem],
@@ -132,126 +184,126 @@ MultimodalDataInputFormat = Union[
 
 @dataclass
 class GenerateReqInput(BaseReq):
-    # The input prompt. It can be a single prompt or a batch of prompts.
+    # 输入提示。可以是单个提示或一批提示。
     text: Optional[Union[List[str], str]] = None
-    # The token ids for text; one can specify either text or input_ids
+    # 文本的 token ID；可以指定 text 或 input_ids 其中之一
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
-    # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
+    # input_ids 的嵌入向量；可以指定 text、input_ids 或 input_embeds 其中之一。
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
-    # Embedding overrides to place at specific token positions.
-    # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
-    # Typed as Any to avoid Pydantic/FastAPI schema errors (PositionalEmbeds contains torch.Tensor).
+    # 放置在特定 token 位置的嵌入覆盖。
+    # 运行时类型：Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
+    # 类型标注为 Any 以避免 Pydantic/FastAPI schema 错误（PositionalEmbeds 包含 torch.Tensor）。
     positional_embed_overrides: Any = None
-    # The image input. It can be an image instance, file name, URL, or base64 encoded string.
-    # Can be formatted as:
-    # - Single image for a single request
-    # - List of images (one per request in a batch)
-    # - List of lists of images (multiple images per request)
-    # See also python/sglang/srt/utils.py:load_image for more details.
+    # 图像输入。可以是图像实例、文件名、URL 或 base64 编码字符串。
+    # 格式可以为：
+    # - 单个请求的单张图像
+    # - 图像列表（批次中每个请求一张）
+    # - 图像列表的列表（每个请求多张图像）
+    # 另见 python/sglang/srt/utils.py:load_image 了解更多细节。
     image_data: Optional[MultimodalDataInputFormat] = None
-    # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
+    # 视频输入。与图像数据类似，可以是文件名、URL 或 base64 编码字符串。
     video_data: Optional[MultimodalDataInputFormat] = None
-    # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
+    # 音频输入。与图像数据类似，可以是文件名、URL 或 base64 编码字符串。
     audio_data: Optional[MultimodalDataInputFormat] = None
-    # The sampling_params. See descriptions below.
+    # 采样参数。见下方描述。
     sampling_params: Optional[Union[List[Dict], Dict]] = None
-    # Whether to return logprobs.
+    # 是否返回 logprobs。
     return_logprob: Optional[Union[List[bool], bool]] = None
-    # If return logprobs, the start location in the prompt for returning logprobs.
-    # By default, this value is "-1", which means it will only return logprobs for output tokens.
+    # 如果返回 logprobs，从提示中的哪个位置开始返回 logprobs。
+    # 默认值为 "-1"，表示只返回输出 token 的 logprobs。
     logprob_start_len: Optional[Union[List[int], int]] = None
-    # If return logprobs, the number of top logprobs to return at each position.
+    # 如果返回 logprobs，每个位置返回的 top logprobs 数量。
     top_logprobs_num: Optional[Union[List[int], int]] = None
-    # If return logprobs, the token ids to return logprob for.
+    # 如果返回 logprobs，需要返回 logprob 的 token ID。
     token_ids_logprob: Optional[Union[List[List[int]], List[int]]] = None
-    # Whether to detokenize tokens in text in the returned logprobs.
+    # 是否在返回的 logprobs 中对 token 进行反 token 化为文本。
     return_text_in_logprobs: bool = False
-    # Whether to stream output.
+    # 是否流式输出。
     stream: bool = False
-    # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
+    # 是否记录此请求的指标（例如 health_generate 调用不记录指标）
     log_metrics: bool = True
-    # Whether to return hidden states
+    # 是否返回隐藏状态
     return_hidden_states: Union[List[bool], bool] = False
-    # Whether to return captured routed experts
+    # 是否返回捕获的路由专家
     return_routed_experts: bool = False
-    # The start location in the prompt for returning routed experts.
+    # 从提示中的哪个位置开始返回路由专家。
     routed_experts_start_len: int = 0
 
-    # The modalities of the image data [image, multi-images, video]
+    # 图像数据的模态 [image, multi-images, video]
     modalities: Optional[List[str]] = None
-    # Session info for continual prompting
+    # 用于持续提示的会话信息
     session_params: Optional[Union[List[Dict], Dict]] = None
 
-    # The path to the LoRA adaptors
+    # LoRA 适配器的路径
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
-    # The uid of LoRA adaptors, should be initialized by tokenizer manager
+    # LoRA 适配器的 uid，应由 tokenizer manager 初始化
     lora_id: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
-    # Custom logit processor for advanced sampling control. Must be a serialized instance
-    # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
-    # Use the processor's `to_str()` method to generate the serialized string.
+    # 用于高级采样控制的自定义 logit 处理器。必须是
+    # python/sglang/srt/sampling/custom_logit_processor.py 中 `CustomLogitProcessor` 的序列化实例。
+    # 使用处理器的 `to_str()` 方法生成序列化字符串。
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
 
-    # For disaggregated inference
+    # 用于分离式推理
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
     bootstrap_pair_key: Optional[Union[List[str], str]] = None
     decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
 
-    # Require reasoning for the request (hybrid reasoning model only)
+    # 要求请求进行推理（仅限混合推理模型）
     require_reasoning: bool = False
 
-    # For DP routing — external router assigns a specific DP worker
+    # 用于 DP 路由 -- 外部路由器分配特定的 DP worker
     routed_dp_rank: Optional[int] = None
-    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
+    # 用于 PD 分离 -- 提示解码端哪个预填充 DP worker 拥有 KV 缓存
     disagg_prefill_dp_rank: Optional[int] = None
-    # Deprecated: use routed_dp_rank instead
+    # 已弃用：请使用 routed_dp_rank 代替
     data_parallel_rank: Optional[int] = None
 
-    # For background responses (OpenAI responses API)
+    # 用于后台响应（OpenAI responses API）
     background: bool = False
 
-    # Conversation id used for tracking requests
+    # 用于跟踪请求的会话 ID
     conversation_id: Optional[str] = None
 
-    # Priority for the request
+    # 请求的优先级
     priority: Optional[int] = None
 
-    # Extra key for classifying the request (e.g. cache_salt)
+    # 用于分类请求的额外键（例如 cache_salt）
     extra_key: Optional[Union[List[str], str]] = None
 
-    # Routing key for routing-key schedule policy
+    # 用于 routing-key 调度策略的路由键
     routing_key: Optional[str] = None
 
-    # Whether to disallow logging for this request (e.g. due to ZDR)
+    # 是否禁止记录此请求的日志（例如由于 ZDR）
     no_logs: bool = False
 
-    # For custom metric labels
+    # 用于自定义指标标签
     custom_labels: Optional[Dict[str, str]] = None
 
-    # (Internal) Whether to return bytes for image generation
+    # （内部）是否返回图像生成的字节数据
     return_bytes: bool = False
 
-    # Whether to return entropy
+    # 是否返回熵
     return_entropy: bool = False
 
-    # Propagates trace context via Engine.generate/async_generate
+    # 通过 Engine.generate/async_generate 传播追踪上下文
     external_trace_header: Optional[Dict] = None
     received_time: Optional[float] = None
 
-    # For EPD-disaggregated inference
+    # 用于 EPD 分离式推理
     need_wait_for_mm_inputs: Optional[bool] = None
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
 
-    # Multimodal tiling controls (extensions)
+    # 多模态分块控制（扩展）
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
     image_max_dynamic_patch: Optional[int] = None
     video_max_dynamic_patch: Optional[int] = None
 
-    # Pre-computed delimiter indices for multi-item scoring.
-    # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
+    # 用于多项评分的预计算分隔符索引。
+    # 批次级别：List[List[int]]（每个请求一个）。经 __getitem__ 后：List[int]。
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
 
     def contains_mm_input(self) -> bool:
@@ -263,16 +315,14 @@ class GenerateReqInput(BaseReq):
 
     def normalize_batch_and_arguments(self):
         """
-        Normalize the batch size and arguments for the request.
+        标准化请求的批次大小和参数。
 
-        This method resolves various input formats and ensures all parameters
-        are properly formatted as either single values or batches depending on the input.
-        It also handles parallel sampling expansion and sets default values for
-        unspecified parameters.
+        该方法处理各种输入格式，确保所有参数根据输入正确格式化为单个值或批次。
+        它还处理并行采样的扩展，并为未指定的参数设置默认值。
 
         Raises:
-            ValueError: If inputs are not properly specified (e.g., none or all of
-                       text, input_ids, input_embeds are provided)
+            ValueError: 如果输入未正确指定（例如 text、input_ids、input_embeds
+                       都未提供或全部提供）
         """
         if self.data_parallel_rank is not None:
             import warnings
@@ -298,7 +348,7 @@ class GenerateReqInput(BaseReq):
         self._validate_rid_uniqueness()
 
     def _validate_inputs(self):
-        """Validate that the input configuration is valid."""
+        """验证输入配置是否有效。"""
         if (
             self.text is None and self.input_ids is None and self.input_embeds is None
         ) or (
@@ -311,7 +361,7 @@ class GenerateReqInput(BaseReq):
             )
 
     def _determine_batch_size(self):
-        """Determine if this is a single example or a batch and the batch size."""
+        """判断这是单个样本还是批次，并确定批次大小。"""
         if self.text is not None:
             if isinstance(self.text, str):
                 self.is_single = True
@@ -339,8 +389,8 @@ class GenerateReqInput(BaseReq):
                 self.batch_size = len(self.input_embeds)
 
     def _handle_parallel_sampling(self):
-        """Handle parallel sampling parameters and adjust batch size if needed."""
-        # Determine parallel sample count
+        """处理并行采样参数，并在需要时调整批次大小。"""
+        # 确定并行采样数量
         if self.sampling_params is None:
             self.parallel_sample_num = 1
             return
@@ -354,7 +404,7 @@ class GenerateReqInput(BaseReq):
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
 
-        # If using parallel sampling with a single example, convert to batch
+        # 如果使用并行采样且为单个样本，则转换为批次
         if self.parallel_sample_num > 1 and self.is_single:
             self.is_single = False
             if self.text is not None:
@@ -365,7 +415,7 @@ class GenerateReqInput(BaseReq):
                 self.input_embeds = [self.input_embeds]
 
     def _normalize_single_inputs(self):
-        """Normalize inputs for a single example."""
+        """标准化单个样本的输入。"""
         if self.sampling_params is None:
             self.sampling_params = {}
         if self.rid is None:
@@ -376,19 +426,19 @@ class GenerateReqInput(BaseReq):
             self.logprob_start_len = -1
         if self.top_logprobs_num is None:
             self.top_logprobs_num = 0
-        if not self.token_ids_logprob:  # covers both None and []
+        if not self.token_ids_logprob:  # 涵盖 None 和 [] 两种情况
             self.token_ids_logprob = None
 
     def _normalize_batch_inputs(self):
-        """Normalize inputs for a batch of examples, including parallel sampling expansion."""
-        # Calculate expanded batch size
+        """标准化批次样本的输入，包括并行采样的扩展。"""
+        # 计算扩展后的批次大小
         if self.parallel_sample_num == 1:
             num = self.batch_size
         else:
-            # Expand parallel_sample_num
+            # 扩展 parallel_sample_num
             num = self.batch_size * self.parallel_sample_num
 
-        # Expand input based on type
+        # 根据类型扩展输入
         self._expand_inputs(num)
         self._normalize_rid(num)
         self._normalize_lora_paths(num)
@@ -401,7 +451,7 @@ class GenerateReqInput(BaseReq):
         self._normalize_bootstrap_params(num)
 
     def _expand_inputs(self, num):
-        """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
+        """为并行采样扩展主要输入（text、input_ids、input_embeds）。"""
         if self.text is not None:
             if not isinstance(self.text, list):
                 raise ValueError("Text should be a list for batch processing.")
@@ -420,7 +470,7 @@ class GenerateReqInput(BaseReq):
             self.input_embeds = self.input_embeds * self.parallel_sample_num
 
     def _normalize_lora_paths(self, num):
-        """Normalize LoRA paths for batch processing."""
+        """标准化批处理的 LoRA 路径。"""
         if self.lora_path is not None:
             if isinstance(self.lora_path, str):
                 self.lora_path = [self.lora_path] * num
@@ -430,15 +480,15 @@ class GenerateReqInput(BaseReq):
                 raise ValueError("lora_path should be a list or a string.")
 
     def _normalize_image_data(self, num):
-        """Normalize image data for batch processing."""
+        """标准化批处理的图像数据。"""
         if self.image_data is None:
             self.image_data = [None] * num
         elif not isinstance(self.image_data, list):
-            # Single image, convert to list of single-image lists
+            # 单张图像，转换为单图像列表的列表
             self.image_data = [[self.image_data]] * num
             self.modalities = ["image"] * num
         elif isinstance(self.image_data, list):
-            # Handle empty list case - treat as no images
+            # 处理空列表的情况 - 视为没有图像
             if len(self.image_data) == 0:
                 self.image_data = [None] * num
                 return
@@ -450,7 +500,7 @@ class GenerateReqInput(BaseReq):
 
             self.modalities = []
             if len(self.image_data) > 0 and isinstance(self.image_data[0], list):
-                # Already a list of lists, keep as is
+                # 已经是列表的列表，保持原样
                 for i in range(len(self.image_data)):
                     if self.image_data[i] is None or self.image_data[i] == [None]:
                         self.modalities.append(None)
@@ -459,20 +509,20 @@ class GenerateReqInput(BaseReq):
                     elif len(self.image_data[i]) > 1:
                         self.modalities.append("multi-images")
                     else:
-                        # Ensure len(self.modalities) == len(self.image_data)
+                        # 确保 len(self.modalities) == len(self.image_data)
                         self.modalities.append(None)
-                # Expand parallel_sample_num
+                # 扩展 parallel_sample_num
                 self.image_data = self.image_data * self.parallel_sample_num
                 self.modalities = self.modalities * self.parallel_sample_num
             else:
-                # List of images for a batch, wrap each in a list
+                # 批次的图像列表，将每个包装在列表中
                 wrapped_images = [[img] for img in self.image_data]
-                # Expand for parallel sampling
+                # 为并行采样扩展
                 self.image_data = wrapped_images * self.parallel_sample_num
                 self.modalities = ["image"] * num
 
     def _normalize_video_data(self, num):
-        """Normalize video data for batch processing."""
+        """标准化批处理的视频数据。"""
         if self.video_data is None:
             self.video_data = [None] * num
         elif not isinstance(self.video_data, list):
@@ -481,7 +531,7 @@ class GenerateReqInput(BaseReq):
             self.video_data = self.video_data * self.parallel_sample_num
 
     def _normalize_audio_data(self, num):
-        """Normalize audio data for batch processing."""
+        """标准化批处理的音频数据。"""
         if self.audio_data is None:
             self.audio_data = [None] * num
         elif not isinstance(self.audio_data, list):
@@ -490,24 +540,24 @@ class GenerateReqInput(BaseReq):
             self.audio_data = self.audio_data * self.parallel_sample_num
 
     def _normalize_sampling_params(self, num):
-        """Normalize sampling parameters for batch processing."""
+        """标准化批处理的采样参数。"""
         if self.sampling_params is None:
             self.sampling_params = [{}] * num
         elif isinstance(self.sampling_params, dict):
             self.sampling_params = [self.sampling_params] * num
-        else:  # Already a list
+        else:  # 已经是列表
             self.sampling_params = self.sampling_params * self.parallel_sample_num
 
     def _normalize_rid(self, num):
-        """Normalize request IDs for batch processing."""
+        """标准化批处理的请求 ID。"""
         if self.rid is None:
             self.rid = [uuid.uuid4().hex for _ in range(num)]
         elif isinstance(self.rid, str):
             new_rids = [f"{self.rid}_{i}" for i in range(num)]
             self.rid = new_rids
         elif isinstance(self.rid, list):
-            # Note: the length of rid shall be the same as the batch_size,
-            # as the rid would be expanded for parallel sampling in tokenizer_manager
+            # 注意：rid 的长度应与 batch_size 相同，
+            # 因为 rid 会在 tokenizer_manager 中为并行采样进行扩展
             if len(self.rid) != self.batch_size:
                 raise ValueError(
                     "The specified rids length mismatch with the batch_size for batch processing."
@@ -516,9 +566,9 @@ class GenerateReqInput(BaseReq):
             raise ValueError("The rid should be a string or a list of strings.")
 
     def _normalize_logprob_params(self, num):
-        """Normalize logprob-related parameters for batch processing."""
+        """标准化批处理的 logprob 相关参数。"""
 
-        # Helper function to normalize a parameter
+        # 标准化参数的辅助函数
         def normalize_param(param, default_value, param_name):
             if param is None:
                 return [default_value] * num
@@ -531,7 +581,7 @@ class GenerateReqInput(BaseReq):
                     )
                 return param
 
-        # Normalize each logprob parameter
+        # 标准化每个 logprob 参数
         self.return_logprob = normalize_param(
             self.return_logprob, False, "return_logprob"
         )
@@ -542,8 +592,8 @@ class GenerateReqInput(BaseReq):
             self.top_logprobs_num, 0, "top_logprobs_num"
         )
 
-        # Handle token_ids_logprob specially due to its nested structure
-        if not self.token_ids_logprob:  # covers both None and []
+        # 由于嵌套结构，需要特殊处理 token_ids_logprob
+        if not self.token_ids_logprob:  # 涵盖 None 和 [] 两种情况
             self.token_ids_logprob = [None] * num
         elif not isinstance(self.token_ids_logprob, list):
             self.token_ids_logprob = [[self.token_ids_logprob] for _ in range(num)]
@@ -557,7 +607,7 @@ class GenerateReqInput(BaseReq):
             )
 
     def _normalize_custom_logit_processor(self, num):
-        """Normalize custom logit processor for batch processing."""
+        """标准化批处理的自定义 logit 处理器。"""
         if self.custom_logit_processor is None:
             self.custom_logit_processor = [None] * num
         elif not isinstance(self.custom_logit_processor, list):
@@ -568,8 +618,8 @@ class GenerateReqInput(BaseReq):
             )
 
     def _normalize_bootstrap_params(self, num):
-        """Normalize bootstrap parameters for batch processing."""
-        # Normalize bootstrap_host
+        """标准化批处理的 bootstrap 参数。"""
+        # 标准化 bootstrap_host
         if self.bootstrap_host is None:
             self.bootstrap_host = [None] * num
         elif not isinstance(self.bootstrap_host, list):
@@ -577,7 +627,7 @@ class GenerateReqInput(BaseReq):
         elif isinstance(self.bootstrap_host, list):
             self.bootstrap_host = self.bootstrap_host * self.parallel_sample_num
 
-        # Normalize bootstrap_port
+        # 标准化 bootstrap_port
         if self.bootstrap_port is None:
             self.bootstrap_port = [None] * num
         elif not isinstance(self.bootstrap_port, list):
@@ -585,7 +635,7 @@ class GenerateReqInput(BaseReq):
         elif isinstance(self.bootstrap_port, list):
             self.bootstrap_port = self.bootstrap_port * self.parallel_sample_num
 
-        # Normalize bootstrap_room
+        # 标准化 bootstrap_room
         if self.bootstrap_room is None:
             self.bootstrap_room = [None] * num
         elif not isinstance(self.bootstrap_room, list):
@@ -593,7 +643,7 @@ class GenerateReqInput(BaseReq):
         elif isinstance(self.bootstrap_room, list):
             self.bootstrap_room = self.bootstrap_room * self.parallel_sample_num
 
-        # Normalize bootstrap_pair_key
+        # 标准化 bootstrap_pair_key
         if self.bootstrap_pair_key is None:
             self.bootstrap_pair_key = [None] * num
         elif not isinstance(self.bootstrap_pair_key, list):
@@ -602,7 +652,7 @@ class GenerateReqInput(BaseReq):
             self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
 
     def _validate_session_params(self):
-        """Validate that session parameters are properly formatted."""
+        """验证会话参数的格式是否正确。"""
         if self.session_params is not None:
             if not isinstance(self.session_params, dict) and not isinstance(
                 self.session_params[0], dict
@@ -612,7 +662,7 @@ class GenerateReqInput(BaseReq):
     def _get_positional_embed_overrides_item(
         self, i: int
     ) -> Optional[PositionalEmbeds]:
-        """Extract the i-th item from positional_embed_overrides."""
+        """从 positional_embed_overrides 中提取第 i 个项。"""
         if self.positional_embed_overrides is None:
             return None
         if isinstance(self.positional_embed_overrides, PositionalEmbeds):
@@ -620,8 +670,8 @@ class GenerateReqInput(BaseReq):
         return self.positional_embed_overrides[i]
 
     def __getitem__(self, i):
-        # Cache sub-objects so that repeated obj[i] calls return the same instance.
-        # This avoids subtle bugs where different call sites get divergent objects.
+        # 缓存子对象，确保重复调用 obj[i] 返回同一实例。
+        # 这避免了不同调用点获取到不同对象的微妙 bug。
         cache = self.__dict__.setdefault("_sub_obj_cache", {})
         if i in cache:
             return cache[i]
@@ -659,7 +709,7 @@ class GenerateReqInput(BaseReq):
                 if self.custom_logit_processor is not None
                 else None
             ),
-            # if `__getitem__` is called, the bootstrap_host, bootstrap_port, bootstrap_room must be a list
+            # 如果调用了 `__getitem__`，bootstrap_host、bootstrap_port、bootstrap_room 必须是列表
             bootstrap_host=(
                 self.bootstrap_host[i] if self.bootstrap_host is not None else None
             ),
@@ -701,81 +751,81 @@ class GenerateReqInput(BaseReq):
 
 @dataclass
 class TokenizedGenerateReqInput(BaseReq):
-    # The input text
+    # 输入文本
     input_text: str
-    # The input token ids
+    # 输入 token ID
     input_ids: List[int]
-    # The multimodal inputs
+    # 多模态输入
     mm_inputs: object
-    # The sampling parameters
+    # 采样参数
     sampling_params: SamplingParams
-    # Whether to return the logprobs
+    # 是否返回 logprobs
     return_logprob: bool
-    # If return logprobs, the start location in the prompt for returning logprobs.
+    # 如果返回 logprobs，从提示中的哪个位置开始返回 logprobs。
     logprob_start_len: int
-    # If return logprobs, the number of top logprobs to return at each position.
+    # 如果返回 logprobs，每个位置返回的 top logprobs 数量。
     top_logprobs_num: int
-    # If return logprobs, the token id to return logprob for
+    # 如果返回 logprobs，需要返回 logprob 的 token ID
     token_ids_logprob: List[int]
-    # Whether to stream output
+    # 是否流式输出
     stream: bool
 
-    # Whether to return hidden states
+    # 是否返回隐藏状态
     return_hidden_states: bool = False
 
-    # Whether to return captured routed experts
+    # 是否返回捕获的路由专家
     return_routed_experts: bool = False
-    # The start location in the prompt for returning routed experts.
+    # 从提示中的哪个位置开始返回路由专家。
     routed_experts_start_len: int = 0
 
-    # The input embeds
+    # 输入嵌入向量
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
 
-    # Embedding overrides to place at specific token positions.
+    # 放置在特定 token 位置的嵌入覆盖。
     positional_embed_overrides: Optional[PositionalEmbeds] = None
 
-    # Session info for continual prompting
+    # 用于持续提示的会话信息
     session_params: Optional[SessionParams] = None
 
-    # LoRA related
-    lora_id: Optional[str] = None  # None means just use the base model
+    # LoRA 相关
+    lora_id: Optional[str] = None  # None 表示仅使用基础模型
 
-    # Custom logit processor for advanced sampling control. Must be a serialized instance
-    # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
-    # Use the processor's `to_str()` method to generate the serialized string.
+    # 用于高级采样控制的自定义 logit 处理器。必须是
+    # python/sglang/srt/sampling/custom_logit_processor.py 中 `CustomLogitProcessor` 的序列化实例。
+    # 使用处理器的 `to_str()` 方法生成序列化字符串。
     custom_logit_processor: Optional[str] = None
 
-    # For disaggregated inference
+    # 用于分离式推理
     bootstrap_host: Optional[str] = None
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
     bootstrap_pair_key: Optional[str] = None
     decode_tp_size: Optional[int] = None
 
-    # Require reasoning for the request (hybrid reasoning model only)
+    # 要求请求进行推理（仅限混合推理模型）
     require_reasoning: bool = False
 
-    # For DP routing
+    # 用于 DP 路由
     routed_dp_rank: Optional[int] = None
-    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
+    # 用于 PD 分离 -- 提示解码端哪个预填充 DP worker 拥有 KV 缓存
     disagg_prefill_dp_rank: Optional[int] = None
 
-    # Priority for the request
+    # 请求的优先级
     priority: Optional[int] = None
 
-    # Extra key for classifying the request (e.g. cache_salt)
+    # 用于分类请求的额外键（例如 cache_salt）
     extra_key: Optional[str] = None
 
-    # Routing key for routing-key schedule policy
+    # 用于 routing-key 调度策略的路由键
     routing_key: Optional[str] = None
 
-    # Whether to disallow logging for this request (e.g. due to ZDR)
+    # 是否禁止记录此请求的日志（例如由于 ZDR）
     no_logs: bool = False
 
-    # (Internal) Whether to return bytes for image generation
+    # （内部）是否返回图像生成的字节数据
     return_bytes: bool = False
 
-    # Whether to return entropy
+    # 是否返回熵
     return_entropy: bool = False
 
     token_type_ids: Optional[List[int]] = None
@@ -783,16 +833,16 @@ class TokenizedGenerateReqInput(BaseReq):
     need_wait_for_mm_inputs: bool = False
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
 
-    # Pre-computed delimiter indices for multi-item scoring
+    # 用于多项评分的预计算分隔符索引
     multi_item_delimiter_indices: Optional[List[int]] = None
 
-    # For observability
+    # 用于可观测性
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
 
 
 @dataclass
 class BatchTokenizedGenerateReqInput(BaseBatchReq):
-    # The batch of tokenized requests
+    # token 化请求的批次
     batch: List[TokenizedGenerateReqInput]
 
     def __len__(self):
@@ -807,86 +857,86 @@ class BatchTokenizedGenerateReqInput(BaseBatchReq):
 
 @dataclass
 class EmbeddingReqInput(BaseReq):
-    # The input prompt. It can be a single prompt or a batch of prompts.
+    # 输入提示。可以是单个提示或一批提示。
     text: Optional[Union[List[List[str]], List[str], str]] = None
-    # The image input. It can be an image instance, file name, URL, or base64 encoded string.
-    # Can be formatted as:
-    # - Single image for a single request
-    # - List of images (one per request in a batch)
-    # - List of lists of images (multiple images per request)
-    # See also python/sglang/srt/utils.py:load_image for more details.
+    # 图像输入。可以是图像实例、文件名、URL 或 base64 编码字符串。
+    # 格式可以为：
+    # - 单个请求的单张图像
+    # - 图像列表（批次中每个请求一张）
+    # - 图像列表的列表（每个请求多张图像）
+    # 另见 python/sglang/srt/utils.py:load_image 了解更多细节。
     image_data: Optional[MultimodalDataInputFormat] = None
-    # The video input. Like image data, it can be a file name, a url, or base64 encoded string.
+    # 视频输入。与图像数据类似，可以是文件名、URL 或 base64 编码字符串。
     video_data: Optional[MultimodalDataInputFormat] = None
-    # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
+    # 音频输入。与图像数据类似，可以是文件名、URL 或 base64 编码字符串。
     audio_data: Optional[MultimodalDataInputFormat] = None
-    # The token ids for text; one can either specify text or input_ids.
+    # 文本的 token ID；可以指定 text 或 input_ids 其中之一。
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
-    # Placeholder token ID used to locate embedding override positions in input token IDs.
+    # 用于定位输入 token ID 中嵌入覆盖位置的占位符 token ID。
     embed_override_token_id: Optional[int] = None
-    # Unresolved embedding overrides: per-input list of tensors.
-    # Position resolution happens in the tokenizer manager after tokenization.
-    # Shape: [num_inputs][num_replacements] where each entry is a torch.Tensor of [hidden_size].
-    # Per-input entry may be None when only some inputs in a batch need overrides.
-    # Runtime type: Optional[List[Optional[List[torch.Tensor]]]]
-    # Typed as Any to avoid Pydantic/FastAPI schema errors (contains torch.Tensor).
+    # 未解析的嵌入覆盖：每个输入的张量列表。
+    # 位置解析在 tokenizer manager 中的 token 化之后进行。
+    # 形状：[num_inputs][num_replacements]，每个条目是 [hidden_size] 的 torch.Tensor。
+    # 当批次中只有部分输入需要覆盖时，每个输入的条目可能为 None。
+    # 运行时类型：Optional[List[Optional[List[torch.Tensor]]]]
+    # 类型标注为 Any 以避免 Pydantic/FastAPI schema 错误（包含 torch.Tensor）。
     embed_overrides: Any = None
-    # Resolved embedding overrides with positions (set by tokenizer manager or score mixin).
-    # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
+    # 已解析的带位置信息的嵌入覆盖（由 tokenizer manager 或 score mixin 设置）。
+    # 运行时类型：Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
     positional_embed_overrides: Any = None
-    # Dummy sampling params for compatibility
+    # 用于兼容性的虚拟采样参数
     sampling_params: Optional[Union[List[Dict], Dict]] = None
-    # Dummy input embeds for compatibility
+    # 用于兼容性的虚拟输入嵌入
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
-    # Whether to log metrics for this request (e.g. health_generate calls do not log metrics)
+    # 是否记录此请求的指标（例如 health_generate 调用不记录指标）
     log_metrics: bool = True
-    # The modalities of the image data [image, multi-images, video]
+    # 图像数据的模态 [image, multi-images, video]
     modalities: Optional[List[str]] = None
-    # For cross-encoder requests
+    # 用于交叉编码器请求
     is_cross_encoder_request: bool = False
-    # Priority for the request
+    # 请求的优先级
     priority: Optional[int] = None
-    # Routing key for routing-key schedule policy
+    # 用于 routing-key 调度策略的路由键
     routing_key: Optional[str] = None
 
-    # For background responses (OpenAI responses API)
+    # 用于后台响应（OpenAI responses API）
     background: bool = False
 
-    # Propagates trace context via Engine.encode/async_encode
+    # 通过 Engine.encode/async_encode 传播追踪上下文
     external_trace_header: Optional[Dict] = None
     received_time: Optional[float] = None
 
-    # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
+    # 结果输出嵌入应具有的维度数。适用于 Matryoshka 嵌入。
     dimensions: Optional[int] = None
 
-    # The path to the LoRA adaptors
+    # LoRA 适配器的路径
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
-    # The uid of LoRA adaptors, should be initialized by tokenizer manager
+    # LoRA 适配器的 uid，应由 tokenizer manager 初始化
     lora_id: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
-    # Whether to return pooled hidden states (pre-head transformer output)
+    # 是否返回池化后的隐藏状态（head 之前的 transformer 输出）
     return_pooled_hidden_states: bool = False
 
-    # Pre-computed delimiter indices for multi-item scoring.
-    # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
+    # 用于多项评分的预计算分隔符索引。
+    # 批次级别：List[List[int]]（每个请求一个）。经 __getitem__ 后：List[int]。
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
 
     def normalize_batch_and_arguments(self):
-        # at least one of text, input_ids, or image should be provided
+        # text、input_ids 或 image 至少需要提供一个
         if self.text is None and self.input_ids is None and self.image_data is None:
             raise ValueError(
                 "At least one of text, input_ids, or image should be provided"
             )
 
-        # text and input_ids cannot be provided at the same time
+        # text 和 input_ids 不能同时提供
         if self.text is not None and self.input_ids is not None:
             raise ValueError("text and input_ids cannot be provided at the same time")
 
-        # Derive the batch size
+        # 推导批次大小
         self.batch_size = 0
         self.is_single = True
 
-        # check the batch size of text
+        # 检查 text 的批次大小
         if self.text is not None:
             if isinstance(self.text, list):
                 self.batch_size += len(self.text)
@@ -894,7 +944,7 @@ class EmbeddingReqInput(BaseReq):
             else:
                 self.batch_size += 1
 
-        # check the batch size of input_ids
+        # 检查 input_ids 的批次大小
         if self.input_ids is not None:
             if isinstance(self.input_ids[0], list):
                 self.batch_size += len(self.input_ids)
@@ -902,7 +952,7 @@ class EmbeddingReqInput(BaseReq):
             else:
                 self.batch_size += 1
 
-        # Fill in default arguments
+        # 填充默认参数
         if self.is_single:
             if self.rid is None:
                 self.rid = uuid.uuid4().hex
@@ -927,7 +977,7 @@ class EmbeddingReqInput(BaseReq):
         self._validate_rid_uniqueness()
 
     def _normalize_lora_paths(self, num):
-        """Normalize LoRA paths for batch processing."""
+        """标准化批处理的 LoRA 路径。"""
         if self.lora_path is not None:
             if isinstance(self.lora_path, str):
                 self.lora_path = [self.lora_path] * num
@@ -949,7 +999,7 @@ class EmbeddingReqInput(BaseReq):
     def _get_positional_embed_overrides_item(
         self, i: int
     ) -> Optional[PositionalEmbeds]:
-        """Extract the i-th item from positional_embed_overrides."""
+        """从 positional_embed_overrides 中提取第 i 个项。"""
         if self.positional_embed_overrides is None:
             return None
         if isinstance(self.positional_embed_overrides, PositionalEmbeds):
@@ -957,7 +1007,7 @@ class EmbeddingReqInput(BaseReq):
         return self.positional_embed_overrides[i]
 
     def __getitem__(self, i):
-        # Cache sub-objects so that repeated obj[i] calls return the same instance.
+        # 缓存子对象，确保重复调用 obj[i] 返回同一实例。
         cache = self.__dict__.setdefault("_sub_obj_cache", {})
         if i in cache:
             return cache[i]
@@ -1014,39 +1064,39 @@ class EmbeddingReqInput(BaseReq):
 
 @dataclass
 class TokenizedEmbeddingReqInput(BaseReq):
-    # The input text
+    # 输入文本
     input_text: str
-    # The input token ids
+    # 输入 token ID
     input_ids: List[int]
-    # The image inputs
+    # 图像输入
     image_inputs: dict
-    # The token type ids
+    # token 类型 ID
     token_type_ids: List[int]
-    # Dummy sampling params for compatibility
+    # 用于兼容性的虚拟采样参数
     sampling_params: SamplingParams
-    # Embedding overrides to place at specific token positions.
+    # 放置在特定 token 位置的嵌入覆盖。
     positional_embed_overrides: Optional[PositionalEmbeds] = None
-    # For DP routing
+    # 用于 DP 路由
     routed_dp_rank: Optional[int] = None
-    # Priority for the request
+    # 请求的优先级
     priority: Optional[int] = None
-    # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
+    # 结果输出嵌入应具有的维度数。适用于 Matryoshka 嵌入。
     dimensions: Optional[int] = None
 
-    # LoRA related
-    lora_id: Optional[str] = None  # None means just use the base model
-    # Pre-computed delimiter indices for multi-item scoring
+    # LoRA 相关
+    lora_id: Optional[str] = None  # None 表示仅使用基础模型
+    # 用于多项评分的预计算分隔符索引
     multi_item_delimiter_indices: Optional[List[int]] = None
-    # For observability
+    # 用于可观测性
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
 
-    # Whether to return pooled hidden states (pre-head transformer output)
+    # 是否返回池化后的隐藏状态（head 之前的 transformer 输出）
     return_pooled_hidden_states: bool = False
 
 
 @dataclass
 class BatchTokenizedEmbeddingReqInput(BaseBatchReq):
-    # The batch of tokenized embedding requests
+    # token 化嵌入请求的批次
     batch: List[TokenizedEmbeddingReqInput]
 
     def __len__(self):
@@ -1061,26 +1111,26 @@ class BatchTokenizedEmbeddingReqInput(BaseBatchReq):
 
 @dataclass
 class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
-    # The finish reason
+    # 完成原因
     finished_reasons: List[BaseFinishReason]
-    # For incremental decoding
+    # 用于增量解码
     decoded_texts: List[str]
     decode_ids: List[int]
     read_offsets: List[int]
-    # Only used when `--skip-tokenizer-init` is on
+    # 仅在 `--skip-tokenizer-init` 开启时使用
     output_ids: Optional[List[int]]
-    # Detokenization configs
+    # 反 token 化配置
     skip_special_tokens: List[bool]
     spaces_between_special_tokens: List[bool]
     no_stop_trim: List[bool]
 
-    # Token counts
+    # token 计数
     prompt_tokens: List[int]
     reasoning_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
 
-    # Logprobs
+    # 对数概率
     input_token_logprobs_val: List[float]
     input_token_logprobs_idx: List[int]
     output_token_logprobs_val: List[float]
@@ -1095,54 +1145,54 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     output_token_ids_logprobs_idx: List[List]
     output_token_entropy_val: List[float]
 
-    # Hidden states
+    # 隐藏状态
     output_hidden_states: List[List[float]]
 
-    # The routed experts for each token, including both input and output tokens
-    # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
+    # 每个 token 的路由专家，包括输入和输出 token
+    # routed_experts[i] 是形状为 (token, layer, top_k) 的张量，对应请求 i
     routed_experts: List[Optional[torch.Tensor]]
 
-    # The information of placeholder tokens (e.g., image token)
-    # idx is the index of the token in the prompt after expansion.
-    # val is the length of padded tokens after expansion.
+    # 占位符 token 的信息（例如图像 token）
+    # idx 是扩展后 token 在提示中的索引。
+    # val 是扩展后填充 token 的长度。
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
-    # Number of times each request was retracted.
+    # 每个请求被回退的次数。
     retraction_counts: List[int]
 
-    # The trainer step id. Used to know which step's weights are used for sampling.
+    # 训练器步骤 ID。用于了解采样使用的是哪一步的权重。
     token_steps: List[List[int]] = None
 
-    # Load for DP balance
+    # 用于 DP 平衡的负载
     load: GetLoadsReqOutput = None
-    # Customized info
+    # 自定义信息
     customized_info: Optional[Dict[str, List[Any]]] = None
-    # Detailed breakdown of cached tokens by source (device/host/storage)
+    # 按来源（设备/主机/存储）分类的缓存 token 详细信息
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
-    # DP rank of the scheduler that processed each request
+    # 处理每个请求的调度器的 DP 排名
     dp_ranks: Optional[List[int]] = None
 
-    # For observability
+    # 用于可观测性
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
 
 @dataclass
 class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
-    # The finish reason
+    # 完成原因
     finished_reasons: List[dict]
-    # The output decoded strings
+    # 输出解码后的字符串
     output_strs: List[str]
-    # The token ids
+    # token ID
     output_ids: Optional[List[int]]
 
-    # Token counts
+    # token 计数
     prompt_tokens: List[int]
     completion_tokens: List[int]
     reasoning_tokens: List[int]
     cached_tokens: List[int]
 
-    # Logprobs
+    # 对数概率
     input_token_logprobs_val: List[float]
     input_token_logprobs_idx: List[int]
     output_token_logprobs_val: List[float]
@@ -1157,62 +1207,62 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     output_token_ids_logprobs_idx: List[List]
     output_token_entropy_val: List[float]
 
-    # Hidden states
+    # 隐藏状态
     output_hidden_states: List[List[float]]
 
-    # The routed experts for each token, including both input and output tokens
-    # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
+    # 每个 token 的路由专家，包括输入和输出 token
+    # routed_experts[i] 是形状为 (token, layer, top_k) 的张量，对应请求 i
     routed_experts: List[Optional[torch.Tensor]]
 
-    # The information of placeholder tokens (e.g., image token)
-    # idx is the index of the token in the prompt after expansion.
-    # val is the length of padded tokens after expansion.
+    # 占位符 token 的信息（例如图像 token）
+    # idx 是扩展后 token 在提示中的索引。
+    # val 是扩展后填充 token 的长度。
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
-    # Number of times each request was retracted.
+    # 每个请求被回退的次数。
     retraction_counts: List[int]
 
-    # The trainer step id. Used to know which step's weights are used for sampling.
+    # 训练器步骤 ID。用于了解采样使用的是哪一步的权重。
     token_steps: List[List[int]] = None
 
-    # Load for DP balance
+    # 用于 DP 平衡的负载
     load: GetLoadsReqOutput = None
 
-    # Customized info
+    # 自定义信息
     customized_info: Optional[Dict[str, List[Any]]] = None
-    # Detailed breakdown of cached tokens by source (device/host/storage)
+    # 按来源（设备/主机/存储）分类的缓存 token 详细信息
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
-    # DP rank of the scheduler that processed each request
+    # 处理每个请求的调度器的 DP 排名
     dp_ranks: Optional[List[int]] = None
 
-    # For observability
+    # 用于可观测性
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
 
 @dataclass
 class BatchEmbeddingOutput(BaseBatchReq):
-    # The finish reason
+    # 完成原因
     finished_reasons: List[BaseFinishReason]
-    # The output embedding
+    # 输出嵌入向量
     embeddings: Union[List[List[float]], List[Dict[int, float]]]
-    # Token counts
+    # token 计数
     prompt_tokens: List[int]
     cached_tokens: List[int]
-    # Placeholder token info
+    # 占位符 token 信息
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
 
-    # Number of times each request was retracted.
+    # 每个请求被回退的次数。
     retraction_counts: List[int]
-    # Detailed breakdown of cached tokens by source (device/host/storage)
+    # 按来源（设备/主机/存储）分类的缓存 token 详细信息
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
 
-    # For observability
+    # 用于可观测性
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
-    # Optional pooled hidden states (pre-head transformer output).
-    # Sent as a single stacked tensor to minimize pickle overhead.
+    # 可选的池化后隐藏状态（head 之前的 transformer 输出）。
+    # 作为单个堆叠张量发送，以减少 pickle 开销。
     pooled_hidden_states: Optional[
         Union[List[Optional[torch.Tensor]], torch.Tensor]
     ] = None
@@ -1280,11 +1330,11 @@ class ListExternalCorporaReqOutput(BaseReq):
 
 @dataclass
 class AttachHiCacheStorageReqInput(BaseReq):
-    """Dynamically attach (enable) HiCache storage backend at runtime.
+    """在运行时动态挂载（启用）HiCache 存储后端。
 
-    Note: `hicache_storage_backend_extra_config_json` is a JSON string. It may contain both:
-    - backend-specific configs (e.g., mooncake master address)
-    - prefetch-related knobs (prefetch_threshold, prefetch_timeout_*, hicache_storage_pass_prefix_keys)
+    注意：`hicache_storage_backend_extra_config_json` 是一个 JSON 字符串。它可能包含：
+    - 后端特定的配置（例如 mooncake master 地址）
+    - 预取相关的参数（prefetch_threshold、prefetch_timeout_*、hicache_storage_pass_prefix_keys）
     """
 
     hicache_storage_backend: str
@@ -1321,7 +1371,7 @@ class AttachHiCacheStorageReqOutput(BaseReq):
 
 @dataclass
 class DetachHiCacheStorageReqInput(BaseReq):
-    """Dynamically detach (disable) HiCache storage backend at runtime."""
+    """在运行时动态卸载（禁用）HiCache 存储后端。"""
 
     pass
 
@@ -1335,21 +1385,20 @@ class DetachHiCacheStorageReqOutput(BaseReq):
 @dataclass
 class PauseGenerationReqInput(BaseReq):
     """
-    Note that the PauseGenerationRequests is only supported in SGLang Server.
-    abort: Abort and return all requests currently being processed.
+    注意 PauseGenerationRequests 仅在 SGLang Server 中支持。
+    abort：终止并返回所有当前正在处理的请求。
 
-    in_place: Pause the scheduler's event_loop from performing inference;
-            only non-inference requests (e.g., control commands) will be handled.
-            The requests in the engine will be paused and stay in the event_loop,
-            then continue generation after continue_generation with the old kv cache.
-            Note: In 'inplace' mode, flush_cache will fail if there are any requests
-            in the running_batch.
+    in_place：暂停调度器的 event_loop 执行推理；
+            只处理非推理请求（例如控制命令）。
+            引擎中的请求将被暂停并留在 event_loop 中，
+            然后在 continue_generation 后使用旧的 KV 缓存继续生成。
+            注意：在 'inplace' 模式下，如果 running_batch 中有任何请求，
+            flush_cache 将会失败。
 
-    retract: Pause the scheduler's event loop from performing inference;
-            only non-inference requests will be handled, and all currently running
-            requests will be retracted back to the waiting_queue.
-            Note: The KV cache can be flushed in this mode and will be automatically
-            recomputed after continue_generation.
+    retract：暂停调度器的 event_loop 执行推理；
+            只处理非推理请求，所有当前运行的请求将被回退到 waiting_queue。
+            注意：在此模式下可以刷新 KV 缓存，刷新后的 KV 缓存将在
+            continue_generation 后自动重新计算。
     """
 
     mode: Literal["abort", "retract", "in_place"] = "abort"
@@ -1369,27 +1418,27 @@ class ContinueGenerationReqInput(BaseReq):
 
 @dataclass
 class UpdateWeightFromDiskReqInput(BaseReq):
-    # The model path with the new weights
+    # 包含新权重的模型路径
     model_path: str
-    # The format to load the weights
+    # 加载权重的格式
     load_format: Optional[str] = None
-    # Whether to abort all requests before updating weights
+    # 是否在更新权重前终止所有请求
     abort_all_requests: bool = False
-    # Optional: Update weight version along with weights
+    # 可选：随权重一起更新权重版本
     weight_version: Optional[str] = None
-    # Whether to update weights asynchronously
+    # 是否异步更新权重
     is_async: bool = False
-    # Whether to empty torch cache
+    # 是否清空 torch 缓存
     torch_empty_cache: bool = False
-    # Whether to keep the scheduler paused after weight update
+    # 权重更新后是否保持调度器暂停
     keep_pause: bool = False
-    # Whether to recapture cuda graph after weight update
+    # 权重更新后是否重新捕获 CUDA 计算图
     recapture_cuda_graph: bool = False
-    # The trainer step id. Used to know which step's weights are used for sampling.
+    # 训练器步骤 ID。用于了解采样使用的是哪一步的权重。
     token_step: int = 0
-    # Whether to flush the cache after updating weights
+    # 更新权重后是否刷新缓存
     flush_cache: bool = True
-    # Tensor metadata
+    # 张量元数据
     manifest: Optional[Dict[str, Any]] = None
 
 
@@ -1397,7 +1446,7 @@ class UpdateWeightFromDiskReqInput(BaseReq):
 class UpdateWeightFromDiskReqOutput(BaseReq):
     success: bool
     message: str
-    # Number of paused requests during weight sync.
+    # 权重同步期间暂停的请求数量。
     num_paused_requests: Optional[int] = 0
 
 
@@ -1406,15 +1455,15 @@ class UpdateWeightsFromDistributedReqInput(BaseReq):
     names: List[str]
     dtypes: List[str]
     shapes: List[List[int]]
-    # The group name
+    # 通信组名称
     group_name: str = "weight_update_group"
-    # Whether to flush the cache after updating weights
+    # 更新权重后是否刷新缓存
     flush_cache: bool = True
-    # Whether to abort all requests before updating weights
+    # 是否在更新权重前终止所有请求
     abort_all_requests: bool = False
-    # Optional: Update weight version along with weights
+    # 可选：随权重一起更新权重版本
     weight_version: Optional[str] = None
-    # Optional format specification for loading
+    # 可选的加载格式规范
     load_format: Optional[str] = None
 
 
@@ -1426,22 +1475,22 @@ class UpdateWeightsFromDistributedReqOutput(BaseReq):
 
 @dataclass
 class UpdateWeightsFromTensorReqInput(BaseReq):
-    """Update model weights from tensor input.
+    """从张量输入更新模型权重。
 
-    - Tensors are serialized for transmission
-    - Data is structured in JSON for easy transmission over HTTP
+    - 张量经过序列化以进行传输
+    - 数据以 JSON 格式组织，便于通过 HTTP 传输
     """
 
     serialized_named_tensors: List[Union[str, bytes]]
-    # Optional format specification for loading
+    # 可选的加载格式规范
     load_format: Optional[str] = None
-    # Whether to flush the cache after updating weights
+    # 更新权重后是否刷新缓存
     flush_cache: bool = True
-    # Whether to abort all requests before updating weights
+    # 是否在更新权重前终止所有请求
     abort_all_requests: bool = False
-    # Optional: Update weight version along with weights
+    # 可选：随权重一起更新权重版本
     weight_version: Optional[str] = None
-    # Optional: Determine whether to disable updating the draft model
+    # 可选：是否禁用草稿模型的更新
     disable_draft_model: Optional[bool] = None
 
 
@@ -1453,29 +1502,29 @@ class UpdateWeightsFromTensorReqOutput(BaseReq):
 
 @dataclass
 class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq):
-    # The master address
+    # 主节点地址
     master_address: str
-    # The ports for each rank's communication group
+    # 每个 rank 通信组的端口
     ports: str
-    # The rank in the communication group
+    # 通信组中的 rank
     group_rank: int
-    # The world size
+    # 世界大小
     world_size: int
-    # The group name
+    # 通信组名称
     group_name: str = "weight_send_group"
-    # The backend
+    # 后端
     backend: str = "nccl"
 
 
-# Now UpdateWeightsFromIPCReqInput and UpdateWeightsFromIPCReqOutput
-# are only used by Checkpoint Engine (https://github.com/MoonshotAI/checkpoint-engine)
+# 目前 UpdateWeightsFromIPCReqInput 和 UpdateWeightsFromIPCReqOutput
+# 仅被 Checkpoint Engine（https://github.com/MoonshotAI/checkpoint-engine）使用
 @dataclass
 class UpdateWeightsFromIPCReqInput(BaseReq):
-    # ZMQ socket paths for each device UUID
+    # 每个设备 UUID 的 ZMQ socket 路径
     zmq_handles: Dict[str, str]
-    # Whether to flush cache after weight update
+    # 权重更新后是否刷新缓存
     flush_cache: bool = True
-    # Optional: Update weight version along with weights
+    # 可选：随权重一起更新权重版本
     weight_version: Optional[str] = None
 
 
@@ -1493,11 +1542,11 @@ class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReq):
 
 @dataclass
 class SendWeightsToRemoteInstanceReqInput(BaseReq):
-    # The master address
+    # 主节点地址
     master_address: str
-    # The ports for each rank's communication group
+    # 每个 rank 通信组的端口
     ports: str
-    # The group name
+    # 通信组名称
     group_name: str = "weight_send_group"
 
 
@@ -1522,17 +1571,17 @@ class BackupDramReq(BaseReq):
 
 @dataclass
 class InitWeightsUpdateGroupReqInput(BaseReq):
-    # The master address
+    # 主节点地址
     master_address: str
-    # The master port
+    # 主节点端口
     master_port: int
-    # The rank offset
+    # rank 偏移量
     rank_offset: int
-    # The world size
+    # 世界大小
     world_size: int
-    # The group name
+    # 通信组名称
     group_name: str = "weight_update_group"
-    # The backend
+    # 后端
     backend: str = "nccl"
 
 
@@ -1555,9 +1604,9 @@ class DestroyWeightsUpdateGroupReqOutput(BaseReq):
 
 @dataclass
 class UpdateWeightVersionReqInput(BaseReq):
-    # The new weight version
+    # 新的权重版本
     new_version: str
-    # Whether to abort all running requests before updating
+    # 更新前是否终止所有正在运行的请求
     abort_all_requests: bool = True
 
 
@@ -1574,8 +1623,8 @@ class GetWeightsByNameReqOutput(BaseReq):
 
 @dataclass
 class ReleaseMemoryOccupationReqInput(BaseReq):
-    # Optional tags to identify the memory region, which is primarily used for RL
-    # Currently we only support `weights` and `kv_cache`
+    # 用于标识内存区域的可选标签，主要用于 RL
+    # 目前仅支持 `weights` 和 `kv_cache`
     tags: Optional[List[str]] = None
 
 
@@ -1586,8 +1635,8 @@ class ReleaseMemoryOccupationReqOutput(BaseReq):
 
 @dataclass
 class ResumeMemoryOccupationReqInput(BaseReq):
-    # Optional tags to identify the memory region, which is primarily used for RL
-    # Currently we only support `weights` and `kv_cache`
+    # 用于标识内存区域的可选标签，主要用于 RL
+    # 目前仅支持 `weights` 和 `kv_cache`
     tags: Optional[List[str]] = None
 
 
@@ -1619,14 +1668,14 @@ class SlowDownReqOutput(BaseReq):
 
 @dataclass
 class AbortReq(BaseReq):
-    # Whether to abort all requests
+    # 是否终止所有请求
     abort_all: bool = False
-    # The finished reason data
+    # 完成原因数据
     finished_reason: Optional[Dict[str, Any]] = None
     abort_message: Optional[str] = None
 
     def __post_init__(self):
-        # FIXME: This is a hack to keep the same with the old code
+        # FIXME: 这是一个临时方案，用于保持与旧代码一致
         if self.rid is None:
             self.rid = ""
 
@@ -1659,27 +1708,27 @@ class SetInternalStateReqOutput(BaseReq):
 
 @dataclass
 class ProfileReqInput(BaseReq):
-    # The output directory
+    # 输出目录
     output_dir: Optional[str] = None
-    # Specify the steps to start the profiling
+    # 指定开始性能分析的步骤
     start_step: Optional[int] = None
-    # If set, it profile as many as this number of steps.
-    # If it is set, profiling is automatically stopped after this step, and
-    # the caller doesn't need to run stop_profile.
+    # 如果设置，则分析该数量的步骤。
+    # 如果设置了该参数，性能分析会在此步骤后自动停止，
+    # 调用者不需要运行 stop_profile。
     num_steps: Optional[int] = None
-    # The activities to record. The choices are ["CPU", "GPU", "MEM", "RPD"]
+    # 要记录的活动。选项为 ["CPU", "GPU", "MEM", "RPD"]
     activities: Optional[List[str]] = None
-    # Whether profile by stages (e.g., prefill and decode) separately
+    # 是否按阶段（例如预填充和解码）分别进行性能分析
     profile_by_stage: bool = False
-    # Whether to record source information (file and line number) for the ops.
+    # 是否记录操作的源信息（文件和行号）。
     with_stack: Optional[bool] = None
-    # Whether to save information about operator’s input shapes.
+    # 是否保存操作符输入形状的信息。
     record_shapes: Optional[bool] = None
-    # Merge profiles from all ranks into a single trace
+    # 合并所有 rank 的性能分析到单个 trace 中
     merge_profiles: bool = False
-    # The prefix of the profile filenames
+    # 性能分析文件名的前缀
     profile_prefix: Optional[str] = None
-    # Only profile these stages and ignore others
+    # 仅分析这些阶段，忽略其他阶段
     profile_stages: Optional[List[str]] = None
 
 
@@ -1780,19 +1829,19 @@ class Tool:
 
 @dataclass
 class ParseFunctionCallReq(BaseReq):
-    text: str  # The text to parse.
+    text: str  # 要解析的文本。
     tools: List[Tool] = field(
         default_factory=list
-    )  # A list of available function tools (name, parameters, etc.).
+    )  # 可用的函数工具列表（名称、参数等）。
     tool_call_parser: Optional[str] = (
-        None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
+        None  # 指定解析器类型，例如 'llama3'、'qwen25' 或 'mistral'。如果未指定，则尝试所有解析器。
     )
 
 
 @dataclass
 class SeparateReasoningReqInput(BaseReq):
-    text: str  # The text to parse.
-    reasoning_parser: str  # Specify the parser type, e.g., "deepseek-r1".
+    text: str  # 要解析的文本。
+    reasoning_parser: str  # 指定解析器类型，例如 "deepseek-r1"。
 
 
 @dataclass
@@ -1815,13 +1864,13 @@ class RpcReqOutput(BaseReq):
 
 @dataclass
 class LoadLoRAAdapterReqInput(BaseReq):
-    # The name of the lora module to newly loaded.
+    # 要新加载的 LoRA 模块名称。
     lora_name: str
-    # The path of loading.
+    # 加载路径。
     lora_path: str
-    # Whether to pin the LoRA adapter in memory.
+    # 是否将 LoRA 适配器固定在内存中。
     pinned: bool = False
-    # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
+    # LoRA 适配器的唯一标识符，在 `TokenizerManager` 中自动生成。
     lora_id: Optional[str] = None
 
     def to_ref(self) -> LoRARef:
@@ -1835,9 +1884,9 @@ class LoadLoRAAdapterReqInput(BaseReq):
 
 @dataclass
 class UnloadLoRAAdapterReqInput(BaseReq):
-    # The name of lora module to unload.
+    # 要卸载的 LoRA 模块名称。
     lora_name: str
-    # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
+    # LoRA 适配器的唯一标识符，在 `TokenizerManager` 中自动生成。
     lora_id: Optional[str] = None
 
     def to_ref(self) -> LoRARef:
@@ -1890,7 +1939,7 @@ class BlockReqInput(BaseReq):
 
 @dataclass
 class MemoryMetrics:
-    """Memory breakdown metrics."""
+    """内存分布指标。"""
 
     weight_gb: float = field(
         metadata={"metric": ("gauge", "Model weight memory in GB")}
@@ -1904,7 +1953,7 @@ class MemoryMetrics:
 
 @dataclass
 class SpeculativeMetrics:
-    """Speculative decoding metrics."""
+    """推测解码指标。"""
 
     accept_length: float = field(
         metadata={"metric": ("gauge", "Avg accepted tokens per step")}
@@ -1916,7 +1965,7 @@ class SpeculativeMetrics:
 
 @dataclass
 class LoRAMetrics:
-    """LoRA adapter pool metrics."""
+    """LoRA 适配器池指标。"""
 
     slots_used: int = field(metadata={"metric": ("gauge", "LoRA adapter slots in use")})
     slots_total: int = field(metadata={"metric": ("gauge", "Total LoRA adapter slots")})
@@ -1927,9 +1976,9 @@ class LoRAMetrics:
 
 @dataclass
 class DisaggregationMetrics:
-    """PD disaggregation metrics."""
+    """PD 分离式指标。"""
 
-    mode: str  # "prefill", "decode", or "null" - not a metric
+    mode: str  # "prefill"、"decode" 或 "null" - 不是指标
     prefill_prealloc_queue_reqs: int = field(
         default=0, metadata={"metric": ("gauge", "Prefill prealloc queue requests")}
     )
@@ -1955,7 +2004,7 @@ class DisaggregationMetrics:
 
 @dataclass
 class QueueMetrics:
-    """Detailed queue breakdown."""
+    """详细的队列分布。"""
 
     waiting: int = field(metadata={"metric": ("gauge", "Main waiting queue size")})
     grammar: int = field(
@@ -1969,7 +2018,7 @@ class QueueMetrics:
 
 @dataclass
 class GetLoadsReqInput(BaseReq):
-    """Request for /v1/loads endpoint."""
+    """/v1/loads 端点的请求。"""
 
     VALID_SECTIONS = frozenset(
         {"core", "memory", "spec", "lora", "disagg", "queues", "all"}
@@ -1979,7 +2028,7 @@ class GetLoadsReqInput(BaseReq):
     dp_rank: Optional[int] = None
 
     def __post_init__(self):
-        """Validate include sections."""
+        """验证 include 部分。"""
         if self.include:
             invalid = set(self.include) - self.VALID_SECTIONS
             if invalid:
@@ -1991,7 +2040,7 @@ class GetLoadsReqInput(BaseReq):
 
 @dataclass
 class GetLoadsReqOutput(BaseReq):
-    """Per-DP-rank load metrics for /v1/loads endpoint."""
+    """每个 DP rank 的负载指标，用于 /v1/loads 端点。"""
 
     dp_rank: int
     timestamp: float
@@ -2005,16 +2054,16 @@ class GetLoadsReqOutput(BaseReq):
     num_used_tokens: int = field(
         metadata={"metric": ("gauge", "Number of tokens in use")}
     )
-    # num_used_tokens + pending prefill tokens (waiting-queue seqlen, incl.
-    # disagg bootstrap/prealloc/transfer queues). Used for DP balance.
+    # num_used_tokens + 待处理的预填充 token（waiting-queue 序列长度，包括
+    # 分离式 bootstrap/prealloc/transfer 队列）。用于 DP 平衡。
     num_total_tokens: int = field(
         metadata={"metric": ("gauge", "Used tokens plus pending prefill tokens")}
     )
     max_total_num_tokens: int = field(
         metadata={"metric": ("gauge", "Maximum token capacity")}
     )
-    # FIXME: token_usage is actually max usage across all pools (KV, SWA, mamba),
-    # not just KV token usage. Rename requires API deprecation.
+    # FIXME: token_usage 实际上是所有池（KV、SWA、mamba）的最大使用量，
+    # 不仅仅是 KV token 使用量。重命名需要 API 弃用流程。
     token_usage: float = field(metadata={"metric": ("gauge", "Token pool usage ratio")})
     gen_throughput: float = field(
         metadata={"metric": ("gauge", "Generation throughput tokens/sec")}
@@ -2075,13 +2124,13 @@ class DumperControlReqOutput(BaseReq):
 
 
 def _check_all_req_types():
-    """A helper function to check all request types are defined in this file."""
+    """辅助函数，检查所有请求类型是否在此文件中定义。"""
     import inspect
     import sys
 
     all_classes = inspect.getmembers(sys.modules[__name__], inspect.isclass)
     for class_type in all_classes:
-        # check its name
+        # 检查类名
         name = class_type[0]
         is_io_struct = (
             name.endswith("Req") or name.endswith("Input") or name.endswith("Output")
