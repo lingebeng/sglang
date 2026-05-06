@@ -46,7 +46,7 @@ class TreeMaskMode(IntEnum):
 
 
 def build_tree_kernel_efficient(
-    verified_id: torch.Tensor,
+    verified_id: torch.Tensor,  # 树的根
     parent_list: List[torch.Tensor],
     top_scores_index: torch.Tensor,
     draft_tokens: torch.Tensor,
@@ -67,7 +67,9 @@ def build_tree_kernel_efficient(
     # e.g. for bs=1, tree_mask: num_draft_token, seq_lens_sum + num_draft_token (flattened)
     # where each row indicates the attending pattern of each draft token
     # if use_partial_packed_tree_mask is True, tree_mask: num_draft_token (flattened, packed)
-    if tree_mask_buf is not None:
+    if (
+        tree_mask_buf is not None
+    ):  # @haifeng 预分配的缓冲区，用来避免每次调用都重新 torch.full() / torch.zeros() 分配显存
         tree_mask = tree_mask_buf
         if tree_mask_mode == TreeMaskMode.QLEN_ONLY:
             tree_mask.fill_(True)
@@ -105,9 +107,11 @@ def build_tree_kernel_efficient(
         raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
 
     # TODO: make them torch.empty and fuse them into `sgl_build_tree_kernel`
+    # 分配 retrieve 缓冲区
     retrieve_buf = torch.full(
         (3, bs, num_verify_tokens), -1, device=device, dtype=torch.long
     )
+
     retrieve_index, retrieve_next_token, retrieve_next_sibling = retrieve_buf
     # position: where each token belongs to
     # e.g. if depth of each draft token is [0, 1, 1, 2] and the prompt length is 7

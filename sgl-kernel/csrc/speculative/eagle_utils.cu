@@ -50,13 +50,17 @@ __global__ void build_tree_efficient(
   if (tid >= draft_token_num) {
     return;
   }
-  int seq_tree_idx = draft_token_num * draft_token_num * bid;
-  for (int i = 0; i < bid; i++) {
-    seq_tree_idx += verified_seq_len[i] * draft_token_num;
-  }
+
   int seq_len = verified_seq_len[bid];
+  // 当前线程（tid）在 tree_mask 中要写的起始位置
   int token_tree_idx;
   if (tree_mask_mode == FULL_MASK) {
+      // 计算当前 batch 在 tree_mask 中的起始偏移量。
+    int seq_tree_idx = draft_token_num * draft_token_num * bid;
+    for (int i = 0; i < bid; i++) {
+      seq_tree_idx += verified_seq_len[i] * draft_token_num;
+    }
+    // 这个 seq_tree_idx 其实只是针对 FULL_MASK 模式的
     token_tree_idx = seq_tree_idx + (seq_len + draft_token_num) * tid + seq_len + 1;
   } else {
     token_tree_idx = draft_token_num * draft_token_num * bid + draft_token_num * tid + 1;
@@ -65,6 +69,7 @@ __global__ void build_tree_efficient(
   for (int i = 0; i < draft_token_num - 1; i++) {
     tree_mask[token_tree_idx + i] = false;
   }
+  // 所以上述代码只是为了构造这个 tree_mask！
 
   int position = 0;
   if (tid == 0) {
@@ -74,10 +79,12 @@ __global__ void build_tree_efficient(
     for (int i = draft_token_num - 1; i > 0; --i) {
       int current_token_idx = retrive_index_offset + i;
       retrive_index[bid * draft_token_num + i] = current_token_idx;
+      // 父节点
       int parent_tb_idx = selected_index[bid * (draft_token_num - 1) + i - 1] / topk;
       int parent_position = 0;
       if (parent_tb_idx > 0) {
         int parent_token_idx = parent_list[bid * (topk * (depth - 1) + 1) + parent_tb_idx];
+        // 这个地方感觉可以用二分，但没必要，draft_token_num 不会很大，线性扫描一下就好
         for (; parent_position < draft_token_num; ++parent_position) {
           if (selected_index[bid * (draft_token_num - 1) + parent_position] == parent_token_idx) {
             ++parent_position;
@@ -91,7 +98,7 @@ __global__ void build_tree_efficient(
             "Please check if the logprob has nan. The token will be ignored to keep proceeding.\n");
         continue;
       }
-
+      // 如果父节点没有孩子
       if (retrive_next_token[bid * draft_token_num + parent_position] == -1) {
         retrive_next_token[bid * draft_token_num + parent_position] = i;
       } else {
