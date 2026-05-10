@@ -37,6 +37,7 @@ from sglang.srt.configs import (
     KimiK25Config,
     KimiLinearConfig,
     KimiVLConfig,
+    LagunaConfig,
     LongcatFlashConfig,
     MultiModalityConfig,
     NemotronH_Nano_Omni_Reasoning_V3_Config,
@@ -79,6 +80,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         MultiModalityConfig,
         KimiVLConfig,
         InternVLChatConfig,
+        LagunaConfig,
         Step3VLConfig,
         LongcatFlashConfig,
         Olmo3Config,
@@ -117,6 +119,12 @@ try:
 
     _CONFIG_REGISTRY["deepseek_v32"] = _DeepseekV32ConfigAlias
     _CONFIG_REGISTRY["deepseek_v4"] = _DeepseekV4ConfigAlias
+
+    # For kimi_k25_eagle3
+    class _KimiK2ConfigAlias(_HFDeepseekV3Config):
+        model_type = "kimi_k2"
+
+    _CONFIG_REGISTRY["kimi_k2"] = _KimiK2ConfigAlias
 except ImportError:
     pass
 
